@@ -5,7 +5,7 @@ inputFileName: input/northernlion_sample_100.csv
 outputFileName: output/northernlion_sample_100_output.csv
 
 # Columns will be processed in order (serially)
-# Each column can reference existing columns and previously generated columns
+# Each column can reference existing columns and previously generated columns, by using {{columnName}} in the prompt
 columns:
 
 
