@@ -24,7 +24,7 @@ columns:
     batchSize: 250
     cooldown: 1500
     prompt: |
-      Extract the game name from a youtube video title of northernlion, a streamer, and you will need to extract the game name, if one is evident. Game names are often, but not always, in parenthesis at the end of the video title. If a game name is not evident, instead return [[Undectable]] - else return game name only, in lower case. The video title is:
+      Extract the game name from a youtube video title of northernlion, a streamer, if a game name is is evident. Game names are often, but not always, in parenthesis at the end of the video title. If a game name is not evident, instead return [[Undectable]] - else return game name only, in lower case. The video title is:
       {{Video}}
       
 
