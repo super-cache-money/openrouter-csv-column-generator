@@ -6,11 +6,12 @@ Generate AI-powered columns for CSV files using OpenRouter.
 
 1. Put in your OPENROUTER_API_KEY into .env
 2. Edit config.yaml to your needs. Some example input and outputs are included.
+3. Run shit:
 
-```bash
-npm install
-node generate-csv-column.js
-```
+    ```bash
+    npm install
+    node generate-csv-column.js
+    ```
 
 ## Data Source
 
