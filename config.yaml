@@ -1,0 +1,30 @@
+# Example configuration for generate-csv-column.js
+# Copy this to config.yaml and customize for your needs
+
+inputFileName: input/northernlion_sample_100.csv
+outputFileName: output/northernlion_sample_100_output.csv
+
+# Columns will be processed in order (serially)
+# Each column can reference existing columns and previously generated columns
+columns:
+
+
+  - columnName: Category
+    modelName: google/gemini-2.5-flash-lite
+    batchSize: 250
+    cooldown: 1500
+    prompt: |
+      Categorize this video title into ONE of these categories: Gaming, Tutorial, Review, Commentary, or Other.
+      Title: {{Video}}
+
+      Respond with only the category name.
+
+  - columnName: Game Name
+    modelName: google/gemini-2.5-flash-lite
+    batchSize: 250
+    cooldown: 1500
+    prompt: |
+      Extract the game name from a youtube video title of northernlion, a streamer, and you will need to extract the game name, if one is evident. Game names are often, but not always, in parenthesis at the end of the video title. If a game name is not evident, instead return [[Undectable]] - else return game name only, in lower case. The video title is:
+      {{Video}}
+      
+

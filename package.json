@@ -1,0 +1,26 @@
+{
+  "name": "youtube-analytics",
+  "version": "1.0.0",
+  "description": "YouTube analytics with AI-powered CSV column generation",
+  "main": "generate-csv-column.js",
+  "type": "module",
+  "scripts": {
+    "generate": "node generate-csv-column.js"
+  },
+  "keywords": [
+    "youtube",
+    "analytics",
+    "csv",
+    "openrouter",
+    "ai"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "csv-parser": "^3.0.0",
+    "csv-writer": "^1.6.0",
+    "js-yaml": "^4.1.0",
+    "dotenv": "^16.4.5",
+    "axios": "^1.7.2"
+  }
+}
