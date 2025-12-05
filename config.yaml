@@ -1,30 +1,38 @@
-# Example configuration for generate-csv-column.js
-# Copy this to config.yaml and customize for your needs
-
 inputFileName: input/northernlion_sample_100.csv
 outputFileName: output/northernlion_sample_100_output.csv
 
-# Columns will be processed in order (serially)
-# Each column can reference existing columns and previously generated columns, by using {{columnName}} in the prompt
 columns:
-
-
-  - columnName: Category
-    modelName: google/gemini-2.5-flash-lite
-    batchSize: 250
-    cooldown: 1500
+  # Single column example
+  - columnName: Summary
+    modelName: google/gemini-2.5-flash
+    batchSize: 100
+    cooldown: 200
     prompt: |
-      Categorize this video title into ONE of these categories: Gaming, Tutorial, Review, Commentary, or Other.
-      Title: {{Video}}
+      Summarize this video in 10 words: {{Video}}
 
-      Respond with only the category name.
-
-  - columnName: Game Name
-    modelName: google/gemini-2.5-flash-lite
-    batchSize: 250
-    cooldown: 1500
-    prompt: |
-      Extract the game name from a youtube video title of northernlion, a streamer, if a game name is is evident. Game names are often, but not always, in parenthesis at the end of the video title. If a game name is not evident, instead return [[Undectable]] - else return game name only, in lower case. The video title is:
-      {{Video}}
-      
-
+  # Grouped columns with web search
+  - group:
+      groupName: "Video Metadata"
+      modelName: google/gemini-2.5-flash:online
+      batchSize: 50
+      cooldown: 200
+      # OpenRouter plugin configuration
+      modelPlugins:
+        - id: "web"
+          engine: "exa"
+          max_results: 10
+      # Search context size: "low", "medium", or "high"
+      webSearchOptions:
+        search_context_size: "high"
+      columns:
+        - Game Name
+        - Category
+        - Sentiment
+      prompt: |
+        For video "{{Video}}", return JSON:
+        {
+          "Game Name": "game name or __undetectable__",
+          "Category": "gaming/vlog/tutorial or __undetectable__",
+          "Sentiment": "positive/neutral/negative"
+        }
+        Return ONLY valid JSON.

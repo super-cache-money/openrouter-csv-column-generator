@@ -41,21 +41,33 @@ function fillPromptTemplate(prompt, rowData) {
  * Call OpenRouter API (no retry logic - handled at batch level)
  * Returns: { result: string, cost: number, promptTokens: number, completionTokens: number }
  */
-async function callOpenRouterAPI(modelName, prompt) {
+async function callOpenRouterAPI(modelName, prompt, plugins = null, webSearchOptions = null) {
+  const requestBody = {
+    model: modelName,
+    messages: [
+      {
+        role: 'user',
+        content: prompt
+      }
+    ],
+    usage: {
+      include: true
+    }
+  };
+
+  // Add plugins if provided
+  if (plugins && Array.isArray(plugins) && plugins.length > 0) {
+    requestBody.plugins = plugins;
+  }
+
+  // Add web_search_options if provided
+  if (webSearchOptions) {
+    requestBody.web_search_options = webSearchOptions;
+  }
+
   const response = await axios.post(
     OPENROUTER_API_URL,
-    {
-      model: modelName,
-      messages: [
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      usage: {
-        include: true
-      }
-    },
+    requestBody,
     {
       headers: {
         'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
@@ -115,83 +127,210 @@ async function writeCSV(filePath, data, headers) {
 }
 
 /**
- * Process a single batch of rows with retry logic
+ * Process a single row (helper for processBatch)
  */
-async function processBatch(rows, batchStart, batchEnd, columnName, modelName, prompt, maxRetries = 10) {
-  let retryCount = 0;
+async function processRow(row, rowIndex, columnInfo, modelName, prompt, plugins, webSearchOptions) {
+  // Fill prompt template with row data
+  const filledPrompt = fillPromptTemplate(prompt, row);
 
-  while (retryCount <= maxRetries) {
+  // Call API
+  const apiResult = await callOpenRouterAPI(modelName, filledPrompt, plugins, webSearchOptions);
+
+  // Store result in row based on column type
+  if (typeof columnInfo === 'string') {
+    // Single column (backward compatible)
+    row[columnInfo] = apiResult.result;
+  } else {
+    // Grouped columns - parse JSON and distribute to columns
     try {
-      // Create array of promises for all rows in this batch
-      const batchPromises = [];
-
-      for (let j = batchStart; j < batchEnd; j++) {
-        const row = rows[j];
-        const rowIndex = j;
-
-        // Create a promise for this row's processing
-        const rowPromise = (async () => {
-          // Fill prompt template with row data
-          const filledPrompt = fillPromptTemplate(prompt, row);
-
-          // Call API
-          const apiResult = await callOpenRouterAPI(modelName, filledPrompt);
-
-          // Store result in row
-          row[columnName] = apiResult.result;
-
-          return {
-            success: true,
-            cost: apiResult.cost,
-            promptTokens: apiResult.promptTokens,
-            completionTokens: apiResult.completionTokens,
-            rowIndex
-          };
-        })();
-
-        batchPromises.push(rowPromise);
+      // Strip markdown code fences if present (```json ... ``` or ``` ... ```)
+      let jsonText = apiResult.result.trim();
+      if (jsonText.startsWith('```')) {
+        // Remove opening fence (```json or ```)
+        jsonText = jsonText.replace(/^```(?:json)?\s*\n?/, '');
+        // Remove closing fence (```)
+        jsonText = jsonText.replace(/\n?```\s*$/, '');
       }
 
-      // Wait for all rows in the batch to complete
-      const batchResults = await Promise.all(batchPromises);
+      const parsed = JSON.parse(jsonText);
+      for (const colName of columnInfo.columns) {
+        row[colName] = parsed[colName] || '__undetectable__';
+      }
+    } catch (parseError) {
+      // JSON parse error - log and set all to __undetectable__
+      console.error(`    ✗ Row ${rowIndex + 1}: Failed to parse JSON - ${parseError.message}`);
+      console.error(`      Response: ${apiResult.result.substring(0, 200)}...`);
+      for (const colName of columnInfo.columns) {
+        row[colName] = '__undetectable__';
+      }
+    }
+  }
 
-      // If we get here, batch succeeded
-      return batchResults;
+  return {
+    success: true,
+    cost: apiResult.cost,
+    promptTokens: apiResult.promptTokens,
+    completionTokens: apiResult.completionTokens,
+    rowIndex
+  };
+}
 
-    } catch (error) {
+/**
+ * Process a single batch of rows with retry logic (only retries failed rows)
+ * columnInfo can be:
+ * - String: single column name (backward compatible)
+ * - Object: { isGroup: true, columns: ["Col1", "Col2", ...] } for grouped columns
+ */
+async function processBatch(rows, batchStart, batchEnd, columnInfo, modelName, prompt, plugins = null, webSearchOptions = null, maxRetries = 10) {
+  // Track rows that need to be processed
+  let rowsToProcess = [];
+  for (let j = batchStart; j < batchEnd; j++) {
+    rowsToProcess.push(j);
+  }
+
+  const allResults = [];
+  let retryCount = 0;
+
+  while (rowsToProcess.length > 0 && retryCount <= maxRetries) {
+    // Create promises for rows that still need processing
+    const batchPromises = rowsToProcess.map(rowIndex => {
+      const row = rows[rowIndex];
+      return processRow(row, rowIndex, columnInfo, modelName, prompt, plugins, webSearchOptions)
+        .then(result => ({ success: true, result, rowIndex }))
+        .catch(error => ({ success: false, error, rowIndex }));
+    });
+
+    // Wait for all promises to settle
+    const results = await Promise.all(batchPromises);
+
+    // Separate successful and failed rows
+    const succeeded = [];
+    const failed = [];
+
+    for (const result of results) {
+      if (result.success) {
+        succeeded.push(result);
+        allResults.push(result.result);
+      } else {
+        failed.push(result);
+      }
+    }
+
+    // Update rows to process - only failed ones
+    rowsToProcess = failed.map(f => f.rowIndex);
+
+    if (rowsToProcess.length > 0) {
       retryCount++;
 
-      const errorMsg = error.response?.data?.error?.message || error.message;
-      const statusCode = error.response?.status || 'N/A';
+      // Log error details from failed rows
+      const errorSummary = {};
+      for (const failure of failed) {
+        const statusCode = failure.error.response?.status || 'N/A';
+        const errorData = failure.error.response?.data;
+
+        // Try to extract detailed error message
+        let errorMsg = failure.error.message;
+        if (errorData) {
+          if (errorData.error?.message) {
+            errorMsg = errorData.error.message;
+          } else if (typeof errorData === 'string') {
+            errorMsg = errorData;
+          } else if (errorData.message) {
+            errorMsg = errorData.message;
+          }
+
+          // Include metadata if available
+          if (errorData.error?.metadata) {
+            errorMsg += ` (${JSON.stringify(errorData.error.metadata)})`;
+          }
+        }
+
+        const key = `${statusCode}: ${errorMsg}`;
+        if (!errorSummary[key]) {
+          errorSummary[key] = [];
+        }
+        errorSummary[key].push(failure.rowIndex + 1);
+      }
 
       if (retryCount > maxRetries) {
-        console.error(`  ✗ Batch FAILED after ${maxRetries} retries`);
-        console.error(`    Status: ${statusCode}, Error: ${errorMsg}`);
-        throw new Error(`Batch failed after ${maxRetries} retries: ${errorMsg}`);
+        console.error(`  ✗ ${rowsToProcess.length} row(s) FAILED after ${maxRetries} retries`);
+        console.error(`    Failed rows: ${rowsToProcess.map(i => i + 1).join(', ')}`);
+        console.error(`    Error summary:`);
+        for (const [error, rows] of Object.entries(errorSummary)) {
+          console.error(`      ${error}`);
+          console.error(`        Affected rows: ${rows.join(', ')}`);
+        }
+
+        throw new Error(`${rowsToProcess.length} row(s) failed after ${maxRetries} retries`);
       }
 
       // Exponential backoff: 2^retryCount seconds
       const backoffMs = Math.pow(2, retryCount) * 1000;
-      console.warn(`  ⚠ Batch failed (attempt ${retryCount}/${maxRetries})`);
-      console.warn(`    Status: ${statusCode}, Error: ${errorMsg}`);
-      console.warn(`    Retrying entire batch in ${backoffMs/1000}s...`);
+      console.warn(`  ⚠ ${rowsToProcess.length} row(s) failed (attempt ${retryCount}/${maxRetries})`);
+      console.warn(`    Retrying failed rows: ${rowsToProcess.map(i => i + 1).join(', ')}`);
+
+      // Log error types
+      for (const [error, rows] of Object.entries(errorSummary)) {
+        console.warn(`    ${error} (rows: ${rows.join(', ')})`);
+      }
+
+      // On first retry, log response body from first failure
+      if (retryCount === 1 && failed.length > 0 && failed[0].error.response?.data) {
+        console.warn(`    Response body: ${JSON.stringify(failed[0].error.response.data)}`);
+      }
+
+      console.warn(`    Waiting ${backoffMs/1000}s before retry...`);
       await sleep(backoffMs);
     }
   }
+
+  return allResults;
 }
 
 /**
- * Process a single column configuration
+ * Process a single column configuration (single or grouped)
  */
-async function processColumn(columnConfig, rows, columnIndex, totalColumns) {
-  const { columnName, modelName, batchSize, cooldown, prompt } = columnConfig;
+async function processColumn(columnConfig, rows, columnIndex, totalColumns, progressFilePath) {
+  // Detect if this is a grouped column or single column
+  const isGrouped = !!columnConfig.group;
+
+  let columnName, modelName, batchSize, cooldown, prompt, plugins, webSearchOptions, columnInfo;
+
+  if (isGrouped) {
+    // Extract from grouped config
+    const group = columnConfig.group;
+    columnName = `${group.groupName} (${group.columns.length} columns: ${group.columns.join(', ')})`;
+    modelName = group.modelName;
+    batchSize = group.batchSize;
+    cooldown = group.cooldown;
+    prompt = group.prompt;
+    plugins = group.modelPlugins || null;
+    webSearchOptions = group.webSearchOptions || null;
+    columnInfo = { isGroup: true, columns: group.columns };
+  } else {
+    // Extract from single column config
+    columnName = columnConfig.columnName;
+    modelName = columnConfig.modelName;
+    batchSize = columnConfig.batchSize;
+    cooldown = columnConfig.cooldown;
+    prompt = columnConfig.prompt;
+    plugins = columnConfig.modelPlugins || null;
+    webSearchOptions = columnConfig.webSearchOptions || null;
+    columnInfo = columnConfig.columnName; // Simple string for backward compatibility
+  }
 
   console.log(`\n${'='.repeat(80)}`);
-  console.log(`Column ${columnIndex + 1}/${totalColumns}: "${columnName}"`);
+  console.log(`${isGrouped ? 'Column Group' : 'Column'} ${columnIndex + 1}/${totalColumns}: "${columnName}"`);
   console.log(`${'='.repeat(80)}`);
   console.log(`Model:      ${modelName}`);
   console.log(`Batch size: ${batchSize}`);
   console.log(`Cooldown:   ${cooldown}ms`);
+  if (plugins && plugins.length > 0) {
+    console.log(`Plugins:    ${JSON.stringify(plugins)}`);
+  }
+  if (webSearchOptions) {
+    console.log(`Web Search: ${JSON.stringify(webSearchOptions)}`);
+  }
   console.log(`Total rows: ${rows.length}`);
 
   const totalRows = rows.length;
@@ -211,7 +350,7 @@ async function processColumn(columnConfig, rows, columnIndex, totalColumns) {
     console.log(`\n  Batch ${batchNumber}/${totalBatches} (rows ${i + 1}-${batchEnd}) - processing ${batchEnd - i} rows in parallel...`);
 
     // Process batch with retry logic
-    const batchResults = await processBatch(rows, i, batchEnd, columnName, modelName, prompt);
+    const batchResults = await processBatch(rows, i, batchEnd, columnInfo, modelName, prompt, plugins, webSearchOptions);
 
     // Aggregate results
     let batchCost = 0;
@@ -230,6 +369,16 @@ async function processColumn(columnConfig, rows, columnIndex, totalColumns) {
     console.log(`    Batch tokens: ${batchTokens.toLocaleString()} | Batch cost: $${batchCost.toFixed(8)}`);
     console.log(`    Running total: ${(totalPromptTokens + totalCompletionTokens).toLocaleString()} tokens | $${totalCost.toFixed(8)}`)
 
+    // Write progress file with all data so far
+    if (progressFilePath) {
+      try {
+        const allHeaders = Object.keys(rows[0]);
+        await writeCSV(progressFilePath, rows, allHeaders);
+      } catch (err) {
+        console.warn(`    ⚠ Failed to write progress file: ${err.message}`);
+      }
+    }
+
     // Apply cooldown between batches (except after last batch)
     if (batchEnd < totalRows && cooldown > 0) {
       console.log(`  ⏸  Cooling down for ${cooldown}ms...`);
@@ -242,7 +391,7 @@ async function processColumn(columnConfig, rows, columnIndex, totalColumns) {
   const totalTokens = totalPromptTokens + totalCompletionTokens;
 
   console.log(`\n${'─'.repeat(80)}`);
-  console.log(`Column "${columnName}" Summary:`);
+  console.log(`${isGrouped ? 'Column Group' : 'Column'} "${isGrouped ? columnConfig.group.groupName : columnName}" Summary:`);
   console.log(`  Total time:     ${(totalElapsed / 1000).toFixed(2)}s`);
   console.log(`  Avg per row:    ${avgTimePerRow.toFixed(0)}ms`);
   console.log(`  Rows processed: ${processedCount}/${totalRows}`);
@@ -305,13 +454,32 @@ async function main() {
     // Validate column configs
     for (let i = 0; i < config.columns.length; i++) {
       const col = config.columns[i];
-      if (!col.columnName || !col.modelName || !col.prompt) {
-        console.error(`  ✗ Column ${i + 1} missing required fields (columnName, modelName, prompt)`);
-        process.exit(1);
+
+      // Detect if this is a grouped column or single column
+      if (col.group) {
+        // Grouped column validation
+        const group = col.group;
+        if (!group.groupName || !group.modelName || !group.prompt || !group.columns || !Array.isArray(group.columns)) {
+          console.error(`  ✗ Column ${i + 1} (grouped) missing required fields (groupName, modelName, prompt, columns array)`);
+          process.exit(1);
+        }
+        if (group.columns.length === 0) {
+          console.error(`  ✗ Column ${i + 1} (grouped) has empty columns array`);
+          process.exit(1);
+        }
+        // Set defaults for grouped columns
+        group.batchSize = group.batchSize || 10;
+        group.cooldown = group.cooldown || 0;
+      } else {
+        // Single column validation (existing logic)
+        if (!col.columnName || !col.modelName || !col.prompt) {
+          console.error(`  ✗ Column ${i + 1} missing required fields (columnName, modelName, prompt)`);
+          process.exit(1);
+        }
+        // Set defaults for single columns
+        col.batchSize = col.batchSize || 10;
+        col.cooldown = col.cooldown || 0;
       }
-      // Set defaults
-      col.batchSize = col.batchSize || 10;
-      col.cooldown = col.cooldown || 0;
     }
 
     // Read input CSV
@@ -341,13 +509,16 @@ async function main() {
     console.log('\n[4/5] Processing columns...');
     const totalColumns = config.columns.length;
 
+    // Create progress file path by replacing .csv with .progress
+    const progressFilePath = config.outputFileName.replace(/\.csv$/i, '.progress');
+
     let grandTotalCost = 0;
     let grandTotalTokens = 0;
     let grandTotalPromptTokens = 0;
     let grandTotalCompletionTokens = 0;
 
     for (let i = 0; i < totalColumns; i++) {
-      const columnStats = await processColumn(config.columns[i], rows, i, totalColumns);
+      const columnStats = await processColumn(config.columns[i], rows, i, totalColumns, progressFilePath);
       grandTotalCost += columnStats.cost;
       grandTotalTokens += columnStats.tokens;
       grandTotalPromptTokens += columnStats.promptTokens;
